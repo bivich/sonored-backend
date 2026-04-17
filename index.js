@@ -7,10 +7,6 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ─── Asegurar que la carpeta uploads existe ───────────────────────────────────
-const UPLOADS_DIR = path.join(__dirname, 'uploads');
-if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
-
 // ─── Middlewares ─────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
@@ -133,7 +129,7 @@ app.delete('/api/campaigns/:id', (req, res) => {
 // ─── Rutas: Audios (subida de archivos) ───────────────────────────────────────
 const multer = require('multer');
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
+  destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
   filename: (req, file, cb) => {
     const clean = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
     cb(null, Date.now() + '_' + clean);
@@ -235,9 +231,24 @@ app.get('/api/speakers/:speakerId/command', (req, res) => {
 // El RPi reporta que reprodujo el audio (para contar plays)
 app.post('/api/speakers/:speakerId/played', (req, res) => {
   const { campaignId } = req.body;
+  const { speakerId } = req.params;
   const db = readDB();
   const campaign = db.campaigns.find(c => c.id === campaignId);
-  if (campaign) { campaign.plays = (campaign.plays || 0) + 1; writeDB(db); }
+  if (campaign) {
+    campaign.plays = (campaign.plays || 0) + 1;
+    // Guardar log detallado para reportería
+    if (!db.playLogs) db.playLogs = [];
+    db.playLogs.push({
+      id: Date.now().toString(),
+      campaignId,
+      speakerId,
+      playedAt: new Date().toISOString(),
+      hour: new Date().getHours()
+    });
+    // Mantener solo los últimos 10,000 logs
+    if (db.playLogs.length > 10000) db.playLogs = db.playLogs.slice(-10000);
+    writeDB(db);
+  }
   res.json({ ok: true });
 });
 
@@ -276,6 +287,127 @@ app.get('/api/stats', (req, res) => {
     activeCampaigns: db.campaigns.filter(c => c.active && c.circuitId).length,
     totalAudios: db.audios.length,
     totalPlays: db.campaigns.reduce((sum, c) => sum + (c.plays || 0), 0)
+  });
+});
+
+
+// ─── Rutas: Reportería ────────────────────────────────────────────────────────
+
+// Reporte por campaña
+app.get("/api/reports/campaigns", (req, res) => {
+  const db = readDB();
+  const logs = db.playLogs || [];
+  const { from, to } = req.query;
+  const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const toDate = to ? new Date(to) : new Date();
+
+  const filtered = logs.filter(l => {
+    const d = new Date(l.playedAt);
+    return d >= fromDate && d <= toDate;
+  });
+
+  const report = db.campaigns.map(c => {
+    const campaignLogs = filtered.filter(l => l.campaignId === c.id);
+    const byDay = {};
+    campaignLogs.forEach(l => {
+      const day = l.playedAt.slice(0, 10);
+      byDay[day] = (byDay[day] || 0) + 1;
+    });
+    return {
+      id: c.id,
+      name: c.name,
+      brand: c.brand,
+      totalPlays: c.plays || 0,
+      playsInRange: campaignLogs.length,
+      byDay: Object.entries(byDay).map(([date, plays]) => ({ date, plays })).sort((a,b) => a.date.localeCompare(b.date))
+    };
+  }).sort((a, b) => b.playsInRange - a.playsInRange);
+
+  res.json(report);
+});
+
+// Reporte por parlante/tienda
+app.get("/api/reports/speakers", (req, res) => {
+  const db = readDB();
+  const logs = db.playLogs || [];
+  const { from, to } = req.query;
+  const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const toDate = to ? new Date(to) : new Date();
+
+  const filtered = logs.filter(l => {
+    const d = new Date(l.playedAt);
+    return d >= fromDate && d <= toDate;
+  });
+
+  const speakerIds = [...new Set([...db.speakers.map(s => s.id), ...filtered.map(l => l.speakerId)])];
+
+  const report = speakerIds.map(speakerId => {
+    const speaker = db.speakers.find(s => s.id === speakerId);
+    const circuit = speaker ? db.circuits.find(c => c.id === speaker.circuitId) : null;
+    const speakerLogs = filtered.filter(l => l.speakerId === speakerId);
+    const byDay = {};
+    speakerLogs.forEach(l => {
+      const day = l.playedAt.slice(0, 10);
+      byDay[day] = (byDay[day] || 0) + 1;
+    });
+    const campaignIds = [...new Set(speakerLogs.map(l => l.campaignId))];
+    const campaigns = campaignIds.map(cid => {
+      const camp = db.campaigns.find(c => c.id === cid);
+      return { id: cid, name: camp ? camp.name : "Campaña eliminada", brand: camp ? camp.brand : "-", plays: speakerLogs.filter(l => l.campaignId === cid).length };
+    });
+    return {
+      id: speakerId,
+      name: speaker ? (speaker.name || speakerId) : speakerId,
+      circuit: circuit ? circuit.name : "Sin circuito",
+      online: speaker ? speaker.online : false,
+      lastSeen: speaker ? speaker.lastSeen : null,
+      playsInRange: speakerLogs.length,
+      byDay: Object.entries(byDay).map(([date, plays]) => ({ date, plays })).sort((a,b) => a.date.localeCompare(b.date)),
+      campaigns
+    };
+  }).sort((a, b) => b.playsInRange - a.playsInRange);
+
+  res.json(report);
+});
+
+// Resumen ejecutivo (para marcas)
+app.get("/api/reports/summary", (req, res) => {
+  const db = readDB();
+  const logs = db.playLogs || [];
+  const { from, to, brand } = req.query;
+  const fromDate = from ? new Date(from) : new Date(Date.now() - 30 * 24 * 60 * 60 * 1000);
+  const toDate = to ? new Date(to) : new Date();
+
+  let filtered = logs.filter(l => {
+    const d = new Date(l.playedAt);
+    return d >= fromDate && d <= toDate;
+  });
+
+  let campaigns = db.campaigns;
+  if (brand) {
+    campaigns = campaigns.filter(c => c.brand.toLowerCase().includes(brand.toLowerCase()));
+    const brandCampaignIds = new Set(campaigns.map(c => c.id));
+    filtered = filtered.filter(l => brandCampaignIds.has(l.campaignId));
+  }
+
+  const uniqueSpeakers = new Set(filtered.map(l => l.speakerId)).size;
+  const byDay = {};
+  filtered.forEach(l => {
+    const day = l.playedAt.slice(0, 10);
+    byDay[day] = (byDay[day] || 0) + 1;
+  });
+
+  res.json({
+    period: { from: fromDate.toISOString(), to: toDate.toISOString() },
+    totalPlays: filtered.length,
+    uniqueSpeakers,
+    activeCampaigns: new Set(filtered.map(l => l.campaignId)).size,
+    byDay: Object.entries(byDay).map(([date, plays]) => ({ date, plays })).sort((a,b) => a.date.localeCompare(b.date)),
+    topCampaigns: campaigns
+      .map(c => ({ name: c.name, brand: c.brand, plays: filtered.filter(l => l.campaignId === c.id).length }))
+      .filter(c => c.plays > 0)
+      .sort((a, b) => b.plays - a.plays)
+      .slice(0, 5)
   });
 });
 
