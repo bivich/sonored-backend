@@ -7,6 +7,10 @@ const fs = require('fs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ─── Asegurar que la carpeta uploads existe ───────────────────────────────────
+const UPLOADS_DIR = path.join(__dirname, 'uploads');
+if (!fs.existsSync(UPLOADS_DIR)) fs.mkdirSync(UPLOADS_DIR, { recursive: true });
+
 // ─── Middlewares ─────────────────────────────────────────────────────────────
 app.use(cors());
 app.use(express.json());
@@ -129,7 +133,7 @@ app.delete('/api/campaigns/:id', (req, res) => {
 // ─── Rutas: Audios (subida de archivos) ───────────────────────────────────────
 const multer = require('multer');
 const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, path.join(__dirname, 'uploads')),
+  destination: (req, file, cb) => cb(null, UPLOADS_DIR),
   filename: (req, file, cb) => {
     const clean = file.originalname.replace(/[^a-zA-Z0-9._-]/g, '_');
     cb(null, Date.now() + '_' + clean);
