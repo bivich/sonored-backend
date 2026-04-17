@@ -1,12 +1,16 @@
 #!/usr/bin/env python3
 """
-SonoRed - Cliente para Raspberry Pi
-Corre en cada parlante. Consulta el servidor cada 10 segundos
-y reproduce el audio de la campaña asignada.
+SonoRed - Cliente para Raspberry Pi CON SENSOR PIR
+El audio suena cuando el sensor detecta una persona.
 
 Instalación en el RPi:
-  sudo apt-get install -y mpg123 python3-requests
+  sudo apt-get install -y mpg123 python3-requests RPi.GPIO
   python3 sonored_client.py
+
+Conexión del sensor PIR:
+  PIR VCC  → Pin 2  (5V)
+  PIR GND  → Pin 6  (GND)
+  PIR OUT  → Pin 11 (GPIO 17)
 """
 
 import time
@@ -16,35 +20,40 @@ import os
 import hashlib
 import tempfile
 import logging
+import RPi.GPIO as GPIO
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger('SonoRed')
 
 # ─── CONFIGURACIÓN ────────────────────────────────────────────────────────────
-# Cambia estos valores en cada Raspberry Pi
-SERVER_URL  = "https://TU-APP.up.railway.app"   # URL de tu backend en Railway
-SPEAKER_ID  = "RPi-001"                          # ID único de este parlante
-CIRCUIT_ID  = "1"                                # ID del circuito al que pertenece
-CHECK_EVERY = 10                                 # segundos entre cada consulta al servidor
+SERVER_URL      = "https://TU-APP.up.railway.app"  # URL de tu backend en Railway
+SPEAKER_ID      = "RPi-001"                         # ID único de este parlante
+CIRCUIT_ID      = "1"                               # ID del circuito
+CHECK_EVERY     = 30                                # segundos entre consultas al servidor
+SENSOR_PIN      = 17                                # GPIO pin del sensor PIR
+COOLDOWN        = 15                                # segundos de espera entre reproducciones
+
+# ─── Setup GPIO ───────────────────────────────────────────────────────────────
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(SENSOR_PIN, GPIO.IN)
 
 # ─── Estado interno ───────────────────────────────────────────────────────────
-current_audio_url = None
-current_process   = None
-audio_cache_dir   = tempfile.gettempdir()
+current_audio_url  = None
+current_process    = None
+last_played        = 0
+audio_cache_dir    = tempfile.gettempdir()
 
 def get_command():
-    """Consulta al servidor qué debe reproducir este parlante."""
     try:
         url = f"{SERVER_URL}/api/speakers/{SPEAKER_ID}/command"
         resp = requests.get(url, params={"circuitId": CIRCUIT_ID}, timeout=8)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        log.warning(f"No se pudo contactar el servidor: {e}")
+        log.warning(f"Sin conexión al servidor: {e}")
         return None
 
 def report_played(campaign_id):
-    """Reporta al servidor que se reprodujo el audio (cuenta plays)."""
     try:
         requests.post(
             f"{SERVER_URL}/api/speakers/{SPEAKER_ID}/played",
@@ -52,14 +61,13 @@ def report_played(campaign_id):
             timeout=5
         )
     except:
-        pass  # No pasa nada si falla, seguimos tocando
+        pass
 
 def download_audio(url):
-    """Descarga el audio y lo cachea localmente por su URL."""
     filename = hashlib.md5(url.encode()).hexdigest() + ".mp3"
     local_path = os.path.join(audio_cache_dir, filename)
     if os.path.exists(local_path):
-        return local_path  # Ya está en caché
+        return local_path
     log.info(f"Descargando audio: {url}")
     try:
         resp = requests.get(url, timeout=30, stream=True)
@@ -67,14 +75,12 @@ def download_audio(url):
         with open(local_path, 'wb') as f:
             for chunk in resp.iter_content(1024 * 64):
                 f.write(chunk)
-        log.info(f"Audio guardado en {local_path}")
         return local_path
     except Exception as e:
         log.error(f"Error descargando audio: {e}")
         return None
 
 def play_audio(local_path):
-    """Reproduce el audio con mpg123 (instalado en el RPi)."""
     global current_process
     stop_audio()
     log.info(f"Reproduciendo: {local_path}")
@@ -85,63 +91,59 @@ def play_audio(local_path):
     )
 
 def stop_audio():
-    """Detiene la reproducción actual."""
     global current_process
     if current_process and current_process.poll() is None:
         current_process.terminate()
         current_process = None
 
 def is_playing():
-    """Retorna True si hay audio reproduciéndose."""
     return current_process is not None and current_process.poll() is None
+
+def person_detected():
+    return GPIO.input(SENSOR_PIN) == GPIO.HIGH
 
 # ─── Loop principal ───────────────────────────────────────────────────────────
 def main():
-    global current_audio_url
-    log.info(f"SonoRed cliente iniciado — Parlante: {SPEAKER_ID} | Circuito: {CIRCUIT_ID}")
-    log.info(f"Servidor: {SERVER_URL}")
+    global current_audio_url, last_played
+    log.info(f"SonoRed CON SENSOR iniciado — Parlante: {SPEAKER_ID} | GPIO: {SENSOR_PIN}")
+
+    cmd = None
+    last_server_check = 0
 
     while True:
-        cmd = get_command()
+        now = time.time()
 
-        if cmd is None:
-            # Sin conexión: seguir tocando lo que hay
-            if not is_playing() and current_audio_url:
+        # Consultar servidor cada CHECK_EVERY segundos
+        if now - last_server_check > CHECK_EVERY:
+            cmd = get_command()
+            last_server_check = now
+            if cmd and cmd.get('command') == 'play':
+                current_audio_url = cmd['audio']['url']
+                download_audio(current_audio_url)  # pre-descarga en caché
+                log.info(f"Campaña lista: {cmd['campaign']['name']}")
+
+        # Si no hay campaña activa, no hacer nada
+        if not cmd or cmd.get('command') != 'play':
+            time.sleep(0.2)
+            continue
+
+        # Detectar presencia
+        if person_detected():
+            cooldown_ok = (now - last_played) > COOLDOWN
+            if cooldown_ok and not is_playing():
+                log.info("Persona detectada — reproduciendo audio")
                 local = download_audio(current_audio_url)
                 if local:
                     play_audio(local)
-            time.sleep(CHECK_EVERY)
-            continue
+                    report_played(cmd['campaign']['id'])
+                    last_played = now
 
-        if cmd.get('command') == 'play':
-            audio_url  = cmd['audio']['url']
-            campaign   = cmd['campaign']
-
-            # Si es un audio diferente al actual, cambiar
-            if audio_url != current_audio_url:
-                log.info(f"Nueva campaña: {campaign['name']}")
-                current_audio_url = audio_url
-                stop_audio()
-
-            # Si no está tocando (terminó o fue detenido), reproducir de nuevo
-            if not is_playing():
-                local = download_audio(audio_url)
-                if local:
-                    play_audio(local)
-                    report_played(campaign['id'])
-
-        else:
-            # idle: pausar si estaba tocando
-            if is_playing():
-                log.info("Sin campaña activa — pausando audio")
-                stop_audio()
-                current_audio_url = None
-
-        time.sleep(CHECK_EVERY)
+        time.sleep(0.1)  # revisar sensor 10 veces por segundo
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
         stop_audio()
+        GPIO.cleanup()
         log.info("Cliente detenido.")
